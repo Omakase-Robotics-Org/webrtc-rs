@@ -12,6 +12,7 @@ pub mod stream;
 pub(crate) mod timer;
 pub(crate) mod util;
 
+pub use association::send_error::transient_send_errors;
 pub use error::Error;
 pub use timer::rtx_timer::{max_timer_backoff, set_max_timer_backoff};
 

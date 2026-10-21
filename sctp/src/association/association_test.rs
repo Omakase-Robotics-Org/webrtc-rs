@@ -2603,3 +2603,232 @@ async fn test_association_handle_packet_before_init() -> Result<()> {
 
     Ok(())
 }
+
+/// A `Conn` over a connected UDP socket whose `send` fails for the next
+/// `fail_next` packets with the error `make_err` builds, then succeeds again.
+struct FailingSendConn {
+    inner: UdpSocket,
+    fail_next: AtomicUsize,
+    failed: AtomicUsize,
+    make_err: fn() -> util::Error,
+}
+
+impl FailingSendConn {
+    fn new(inner: UdpSocket, make_err: fn() -> util::Error) -> Self {
+        FailingSendConn {
+            inner,
+            fail_next: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            make_err,
+        }
+    }
+
+    fn fail_next(&self, n: usize) {
+        self.fail_next.store(n, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Conn for FailingSendConn {
+    async fn connect(&self, addr: SocketAddr) -> UResult<()> {
+        Conn::connect(&self.inner, addr).await
+    }
+
+    async fn recv(&self, b: &mut [u8]) -> UResult<usize> {
+        Conn::recv(&self.inner, b).await
+    }
+
+    async fn recv_from(&self, b: &mut [u8]) -> UResult<(usize, SocketAddr)> {
+        Conn::recv_from(&self.inner, b).await
+    }
+
+    async fn send(&self, b: &[u8]) -> UResult<usize> {
+        let armed = self
+            .fail_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if armed {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            return Err((self.make_err)());
+        }
+        Conn::send(&self.inner, b).await
+    }
+
+    async fn send_to(&self, b: &[u8], target: SocketAddr) -> UResult<usize> {
+        Conn::send_to(&self.inner, b, target).await
+    }
+
+    fn local_addr(&self) -> UResult<SocketAddr> {
+        Conn::local_addr(&self.inner)
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        Conn::remote_addr(&self.inner)
+    }
+
+    async fn close(&self) -> UResult<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+/// The error the WebRTC stack hands SCTP when the kernel refuses a UDP
+/// `sendto` with EPERM (an iptables DROP on OUTPUT): webrtc-ice's
+/// `AgentConn::send` flattens the socket error into an `io::Error::other`
+/// string, DTLS wraps it in `dtls::Error::Util`, and `DTLSConn::send` boxes
+/// that with `util::Error::from_std`. Rebuilt here without the dtls type:
+/// `Std(Io(Other("io error: Operation not permitted (os error 1)")))`.
+fn eperm_as_the_webrtc_stack_reports_it() -> util::Error {
+    let socket_err = util::Error::from(io::Error::from_raw_os_error(1)); // EPERM on Linux and macOS
+    let flattened = util::Error::from(io::Error::other(socket_err.to_string()));
+    util::Error::from_std(flattened)
+}
+
+/// What webrtc-ice's `AgentConn::send` returns once the ICE agent is closed.
+fn ice_conn_closed() -> util::Error {
+    io::Error::other("Conn is closed").into()
+}
+
+async fn create_assocs_with_failing_client(
+    make_err: fn() -> util::Error,
+) -> Result<(Association, Association, Arc<FailingSendConn>)> {
+    let udp1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp1.connect(udp2.local_addr().unwrap()).await.unwrap();
+    udp2.connect(udp1.local_addr().unwrap()).await.unwrap();
+
+    let conn1 = Arc::new(FailingSendConn::new(udp1, make_err));
+    let net_conn1 = Arc::clone(&conn1) as Arc<dyn Conn + Send + Sync>;
+    let client = tokio::spawn(async move {
+        Association::client(Config {
+            net_conn: net_conn1,
+            max_receive_buffer_size: 0,
+            max_message_size: 0,
+            mtu: 0,
+            name: "client".to_owned(),
+            local_port: 5000,
+            remote_port: 5000,
+        })
+        .await
+    });
+    let server = tokio::spawn(async move {
+        Association::server(Config {
+            net_conn: Arc::new(udp2),
+            max_receive_buffer_size: 0,
+            max_message_size: 0,
+            mtu: 0,
+            name: "server".to_owned(),
+            local_port: 5000,
+            remote_port: 5000,
+        })
+        .await
+    });
+    let a1 = tokio::time::timeout(Duration::from_secs(2), client)
+        .await
+        .expect("client handshake timed out")
+        .unwrap()?;
+    let a2 = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server handshake timed out")
+        .unwrap()?;
+    Ok((a1, a2, conn1))
+}
+
+async fn read_one(s: &Arc<Stream>, within: Duration) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 64];
+    match tokio::time::timeout(within, s.read(&mut buf)).await {
+        Ok(Ok(n)) => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+/// A route flap: the net conn refuses the next sends with EPERM, as the
+/// kernel does for an iptables DROP on OUTPUT. The association must drop
+/// those packets, stay open, and deliver the data once sends succeed again
+/// (T3-rtx retransmits what was dropped).
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_assoc_survives_transient_send_errors() -> Result<()> {
+    const FAILED_SENDS: usize = 3;
+    let (a1, a2, conn1) =
+        create_assocs_with_failing_client(eperm_as_the_webrtc_stack_reports_it).await?;
+    let s11 = a1.open_stream(1, PayloadProtocolIdentifier::Binary).await?;
+
+    // One message before the flap opens the stream on the server side.
+    s11.write(&Bytes::from_static(b"before")).await?;
+    let s21 = tokio::time::timeout(Duration::from_secs(2), a2.accept_stream())
+        .await
+        .expect("accept_stream timed out")
+        .expect("server association closed");
+    assert_eq!(
+        read_one(&s21, Duration::from_secs(2)).await.as_deref(),
+        Some(&b"before"[..])
+    );
+
+    // The flap: each of these writes leaves as its own packet and is refused.
+    conn1.fail_next(FAILED_SENDS);
+    let sent: Vec<Vec<u8>> = (0..FAILED_SENDS)
+        .map(|i| format!("during-{i}").into_bytes())
+        .collect();
+    for m in &sent {
+        s11.write(&Bytes::from(m.clone())).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(conn1.failed.load(Ordering::SeqCst), FAILED_SENDS);
+    assert_eq!(
+        a1.get_state(),
+        AssociationState::Established,
+        "a transient send error closed the association"
+    );
+
+    // Sends succeed again: T3-rtx (RTO >= 1 s) retransmits the dropped DATA.
+    for m in &sent {
+        assert_eq!(
+            read_one(&s21, Duration::from_secs(5)).await.as_ref(),
+            Some(m),
+            "dropped data never arrived"
+        );
+    }
+    s11.write(&Bytes::from_static(b"after")).await?;
+    assert_eq!(
+        read_one(&s21, Duration::from_secs(2)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(a1.get_state(), AssociationState::Established);
+    assert_eq!(a2.get_state(), AssociationState::Established);
+    assert_eq!(a1.transient_send_errors(), FAILED_SENDS as u64);
+    assert!(crate::transient_send_errors() >= FAILED_SENDS as u64);
+
+    a1.close().await?;
+    a2.close().await?;
+    Ok(())
+}
+
+/// A send error that says the connection is gone stays fatal: the write loop
+/// closes the association as webrtc-sctp 0.17.2 always did.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_assoc_closes_on_fatal_send_error() -> Result<()> {
+    let (a1, _a2, conn1) = create_assocs_with_failing_client(ice_conn_closed).await?;
+    let s11 = a1.open_stream(1, PayloadProtocolIdentifier::Binary).await?;
+    conn1.fail_next(1);
+    s11.write(&Bytes::from_static(b"x")).await?;
+    // The write loop acts on the failure once it is woken again; a second
+    // write wakes it (the stock behaviour, not changed here).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = s11.write(&Bytes::from_static(b"y")).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while a1.get_state() != AssociationState::Closed {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a fatal send error did not close the association"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(conn1.failed.load(Ordering::SeqCst), 1);
+    assert_eq!(a1.transient_send_errors(), 0);
+    Ok(())
+}

@@ -3,17 +3,18 @@ mod association_test;
 
 mod association_internal;
 mod association_stats;
+pub(crate) mod send_error;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use association_internal::*;
 use association_stats::*;
 use bytes::{Bytes, BytesMut};
-use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize};
+use portable_atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize};
 use rand::random;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use util::Conn;
@@ -230,6 +231,7 @@ pub struct Association {
     net_conn: Arc<dyn Conn + Send + Sync>,
     bytes_received: Arc<AtomicUsize>,
     bytes_sent: Arc<AtomicUsize>,
+    transient_send_errors: Arc<AtomicU64>,
 
     pub(crate) association_internal: Arc<Mutex<AssociationInternal>>,
 }
@@ -325,6 +327,7 @@ impl Association {
 
         let bytes_received = Arc::new(AtomicUsize::new(0));
         let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let transient_send_errors = Arc::new(AtomicU64::new(0));
         let name = ai.name.clone();
         let state = Arc::clone(&ai.state);
         let max_message_size = Arc::clone(&ai.max_message_size);
@@ -383,6 +386,7 @@ impl Association {
             tokio::spawn(Association::write_loop(
                 name.clone(),
                 Arc::clone(&bytes_sent),
+                Arc::clone(&transient_send_errors),
                 Arc::clone(&net_conn),
                 close_loop_ch_rx2,
                 Arc::clone(&association_internal),
@@ -413,6 +417,7 @@ impl Association {
                 net_conn,
                 bytes_received,
                 bytes_sent,
+                transient_send_errors,
                 association_internal,
             },
             handshake_completed_ch_rx,
@@ -477,6 +482,7 @@ impl Association {
     async fn write_loop(
         name: String,
         bytes_sent: Arc<AtomicUsize>,
+        transient_send_errors: Arc<AtomicU64>,
         net_conn: Arc<dyn Conn + Send + Sync>,
         mut close_loop_ch: broadcast::Receiver<()>,
         association_internal: Arc<Mutex<AssociationInternal>>,
@@ -485,6 +491,9 @@ impl Association {
         log::debug!("[{name}] write_loop entered");
         let done = Arc::new(AtomicBool::new(false));
         let name = Arc::new(name);
+        // A burst of transient send errors: when it began and how many
+        // packets it dropped. Logged once at its start and once at its end.
+        let mut send_error_burst: Option<(Instant, u64)> = None;
 
         'outer: while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
@@ -513,11 +522,42 @@ impl Association {
                 {
                     Ok(Ok(mut buf)) => {
                         let raw = buf.as_ref();
-                        if let Err(err) = net_conn.send(raw.as_ref()).await {
-                            log::warn!("[{name2}] failed to write packets on net_conn: {err}");
-                            done2.store(true, Ordering::Relaxed)
-                        } else {
-                            bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                        match net_conn.send(raw.as_ref()).await {
+                            Ok(_) => {
+                                bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                                if let Some((since, dropped)) = send_error_burst.take() {
+                                    log::warn!(
+                                        "[{name2}] net_conn writes recovered after {:?}: {dropped} packet(s) dropped on transient send errors",
+                                        since.elapsed()
+                                    );
+                                }
+                            }
+                            // A route flap (EPERM, ENETUNREACH, ...): drop
+                            // the packet and keep the association; T3-rtx
+                            // retransmits dropped DATA, heartbeats and the
+                            // application judge liveness.
+                            Err(err) if send_error::is_transient_send_error(&err) => {
+                                transient_send_errors.fetch_add(1, Ordering::Relaxed);
+                                send_error::count_transient_send_error();
+                                match &mut send_error_burst {
+                                    None => {
+                                        log::warn!(
+                                            "[{name2}] transient error writing to net_conn, dropping packets until it clears: {err}"
+                                        );
+                                        send_error_burst = Some((Instant::now(), 1));
+                                    }
+                                    Some((_, dropped)) => {
+                                        *dropped += 1;
+                                        log::debug!(
+                                            "[{name2}] transient error writing to net_conn: {err}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!("[{name2}] failed to write packets on net_conn: {err}");
+                                done2.store(true, Ordering::Relaxed)
+                            }
                         }
 
                         // Reuse allocation. Have to use options, since spawn blocking can't borrow, has to take ownership.
@@ -568,6 +608,12 @@ impl Association {
     /// bytes_sent returns the number of bytes sent
     pub fn bytes_sent(&self) -> usize {
         self.bytes_sent.load(Ordering::SeqCst)
+    }
+
+    /// The number of packets this association dropped on a transient
+    /// `net_conn` send error (a route flap) while staying open.
+    pub fn transient_send_errors(&self) -> u64 {
+        self.transient_send_errors.load(Ordering::Relaxed)
     }
 
     /// bytes_received returns the number of bytes received
