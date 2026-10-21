@@ -142,6 +142,42 @@ mod test_rto_manager {
         Ok(())
     }
 
+    #[test]
+    fn test_max_timer_backoff_default_is_rto_max() {
+        // No test in this binary changes the process-wide cap; the setter
+        // itself is exercised in tests/max_timer_backoff.rs (its own process).
+        assert_eq!(max_timer_backoff(), Duration::from_millis(RTO_MAX));
+        let seq: Vec<u64> = (0..8).map(|n| calculate_next_timeout(1000, n)).collect();
+        assert_eq!(
+            seq,
+            vec![1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_timeout_capped_flattens_at_cap() {
+        let seq: Vec<u64> = (0..6)
+            .map(|n| calculate_next_timeout_capped(1000, n, 1000))
+            .collect();
+        assert_eq!(seq, vec![1000; 6]);
+        let seq: Vec<u64> = (0..6)
+            .map(|n| calculate_next_timeout_capped(300, n, 1000))
+            .collect();
+        assert_eq!(seq, vec![300, 600, 1000, 1000, 1000, 1000]);
+        assert_eq!(calculate_next_timeout_capped(300, 63, 1000), 1000);
+    }
+
+    #[test]
+    fn test_calculate_next_timeout_capped_never_below_rto() {
+        // A cap below the current RTO leaves the RTO itself as the bound.
+        let seq: Vec<u64> = (0..4)
+            .map(|n| calculate_next_timeout_capped(3000, n, 1000))
+            .collect();
+        assert_eq!(seq, vec![3000; 4]);
+        assert_eq!(calculate_next_timeout_capped(3000, 64, 1000), 3000);
+        assert_eq!(calculate_next_timeout_capped(1500, 0, 0), 1500);
+    }
+
     #[tokio::test]
     async fn test_rto_manager_reset() -> Result<()> {
         let mut m = RtoManager::new();

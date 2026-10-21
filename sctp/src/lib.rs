@@ -13,6 +13,7 @@ pub(crate) mod timer;
 pub(crate) mod util;
 
 pub use error::Error;
+pub use timer::rtx_timer::{max_timer_backoff, set_max_timer_backoff};
 
 #[cfg(test)]
 mod fuzz_artifact_test;

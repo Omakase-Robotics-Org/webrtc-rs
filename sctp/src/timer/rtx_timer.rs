@@ -1,6 +1,8 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
+use portable_atomic::AtomicU64;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
@@ -81,16 +83,52 @@ impl RtoManager {
     }
 }
 
+/// The process-wide upper bound of the T3-rtx / T1 backoff, in msec.
+/// Defaults to RTO.max, which is the behaviour of webrtc-sctp 0.17.2.
+static MAX_TIMER_BACKOFF_MS: AtomicU64 = AtomicU64::new(RTO_MAX);
+
+/// Caps the exponential backoff of the retransmission timers, process-wide.
+///
+/// RFC 4960 sec 6.3.3 rule E2 doubles the timer on each expiry, bounded by
+/// RTO.max (60 s). After a path outage of a few seconds, a chunk that was
+/// already retransmitted (and so is no longer eligible for fast
+/// retransmission) then waits for a timer that has backed off to many
+/// seconds, although the path is back. With a cap, the timer interval is
+/// `min(rto << n, max(rto, cap))`: the backoff stops growing at `cap`, and
+/// never goes below the current RTO, so a short cap causes no expiry earlier
+/// than the RTO estimate itself would. RTO.min / RTO.max for the RTO
+/// estimate are unchanged.
+///
+/// The default is 60 s (RTO.max), which leaves the behaviour unchanged. The
+/// setting applies to every association in the process, including ones
+/// already running (from their next timer interval on); set it once at
+/// start-up, before any association is created.
+pub fn set_max_timer_backoff(cap: Duration) {
+    let ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX);
+    MAX_TIMER_BACKOFF_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The current process-wide backoff cap (see [`set_max_timer_backoff`]).
+pub fn max_timer_backoff() -> Duration {
+    Duration::from_millis(MAX_TIMER_BACKOFF_MS.load(Ordering::Relaxed))
+}
+
 pub(crate) fn calculate_next_timeout(rto: u64, n_rtos: usize) -> u64 {
+    calculate_next_timeout_capped(rto, n_rtos, MAX_TIMER_BACKOFF_MS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn calculate_next_timeout_capped(rto: u64, n_rtos: usize, cap: u64) -> u64 {
     // RFC 4096 sec 6.3.3.  Handle T3-rtx Expiration
     //   E2)  For the destination address for which the timer expires, set RTO
     //        <- RTO * 2 ("back off the timer").  The maximum value discussed
     //        in rule C7 above (RTO.max) may be used to provide an upper bound
     //        to this doubling operation.
+    // The bound is the configured cap, never below the current RTO.
+    let bound = std::cmp::max(rto, cap);
     if n_rtos < 31 {
-        std::cmp::min(rto << n_rtos, RTO_MAX)
+        std::cmp::min(rto << n_rtos, bound)
     } else {
-        RTO_MAX
+        bound
     }
 }
 
