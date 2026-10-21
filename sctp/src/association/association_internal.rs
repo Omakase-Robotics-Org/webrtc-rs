@@ -23,6 +23,9 @@ pub struct AssociationInternal {
     pub(crate) my_next_tsn: u32, // nextTSN
     peer_last_tsn: u32,          // lastRcvdTSN
     min_tsn2measure_rtt: u32,    // for RTT measurement
+    // No RTT sample from a TSN below this: the chunks outstanding when T3-rtx
+    // last expired (see on_retransmission_timeout).
+    rtt_exclude_below: u32,
     will_send_forward_tsn: bool,
     will_retransmit_fast: bool,
     will_retransmit_reconfig: bool,
@@ -141,6 +144,7 @@ impl AssociationInternal {
             my_next_tsn: tsn,
             peer_last_tsn: 0,
             min_tsn2measure_rtt: tsn,
+            rtt_exclude_below: tsn,
             will_send_forward_tsn: false,
             will_retransmit_fast: false,
             will_retransmit_reconfig: false,
@@ -1160,7 +1164,10 @@ impl AssociationInternal {
                     //        packets that were retransmitted (and thus for which it is
                     //        ambiguous whether the reply was for the first instance of the
                     //        chunk or for a later instance)
-                    if c.nsent == 1 && sna32gte(c.tsn, self.min_tsn2measure_rtt) {
+                    if c.nsent == 1
+                        && sna32gte(c.tsn, self.min_tsn2measure_rtt)
+                        && sna32gte(c.tsn, self.rtt_exclude_below)
+                    {
                         self.min_tsn2measure_rtt = self.my_next_tsn;
                         let rtt = match SystemTime::now().duration_since(c.since) {
                             Ok(rtt) => rtt,
@@ -1217,7 +1224,7 @@ impl AssociationInternal {
 
                         log::trace!("[{}] tsn={} has been sacked", self.name, c.tsn);
 
-                        if c.nsent == 1 {
+                        if c.nsent == 1 && sna32gte(c.tsn, self.rtt_exclude_below) {
                             self.min_tsn2measure_rtt = self.my_next_tsn;
                             let rtt = match SystemTime::now().duration_since(c.since) {
                                 Ok(rtt) => rtt,
@@ -2409,6 +2416,16 @@ impl RtxTimerObserver for AssociationInternal {
                     self.cwnd,
                     self.ssthresh
                 );
+
+                // Karn's rule (RFC 4960 sec 6.3.1 C5) only excludes chunks that
+                // were retransmitted. A chunk sent once that was outstanding
+                // across this expiry is just as ambiguous: its SACK may have
+                // been lost with the path, and a sample taken when the path
+                // returns measures the outage, not the round trip (an RTO of
+                // seconds, which then holds the chunks resent during the
+                // outage until the next expiry). So no RTT sample is taken
+                // from any TSN sent before this expiry.
+                self.rtt_exclude_below = self.my_next_tsn;
 
                 self.inflight_queue.mark_all_to_retrasmit();
                 self.awake_write_loop();

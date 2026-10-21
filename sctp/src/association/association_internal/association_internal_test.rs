@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use super::*;
 
@@ -630,5 +631,91 @@ async fn test_assoc_max_message_size_explicit() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+use crate::chunk::chunk_selective_ack::GapAckBlock;
+
+fn rtt_test_association() -> AssociationInternal {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.cumulative_tsn_ack_point = 9;
+    a.min_tsn2measure_rtt = 10;
+    a.rtt_exclude_below = 10;
+    a.my_next_tsn = 13;
+    for tsn in 10..13 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            // Sent 4 s ago: the SACK for it was lost with the path.
+            since: SystemTime::now() - Duration::from_secs(4),
+            ..Default::default()
+        });
+    }
+    a
+}
+
+fn sack_10_and_gap_12() -> ChunkSelectiveAck {
+    ChunkSelectiveAck {
+        cumulative_tsn_ack: 10,
+        advertised_receiver_window_credit: 1 << 20,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 2 }],
+        duplicate_tsn: vec![],
+    }
+}
+
+#[tokio::test]
+async fn test_rtt_sampled_from_a_chunk_sent_once_without_expiry() -> Result<()> {
+    let mut a = rtt_test_association();
+    a.process_selective_ack(&sack_10_and_gap_12()).await?;
+    assert!(a.rto_mgr.srtt >= 4000, "srtt {}", a.rto_mgr.srtt);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_no_rtt_sample_from_chunks_outstanding_across_t3_expiry() -> Result<()> {
+    let mut a = rtt_test_association();
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    // Cumulative ack (10) and gap ack (12): neither is measured.
+    a.process_selective_ack(&sack_10_and_gap_12()).await?;
+    assert_eq!(a.rto_mgr.srtt, 0, "no sample taken");
+    assert_eq!(a.rto_mgr.get_rto(), crate::timer::rtx_timer::RTO_INITIAL);
+
+    // A chunk sent after the expiry is measured again.
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: 13,
+        stream_identifier: 1,
+        user_data: Bytes::from_static(b"ABC"),
+        nsent: 1,
+        since: SystemTime::now() - Duration::from_millis(20),
+        ..Default::default()
+    });
+    a.my_next_tsn = 14;
+    a.cumulative_tsn_ack_point = 10; // what handle_sack records after the first SACK
+    a.process_selective_ack(&ChunkSelectiveAck {
+        cumulative_tsn_ack: 10,
+        advertised_receiver_window_credit: 1 << 20,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 3 }],
+        duplicate_tsn: vec![],
+    })
+    .await?;
+    assert!(
+        a.rto_mgr.srtt >= 20 && a.rto_mgr.srtt < 1000,
+        "srtt {}",
+        a.rto_mgr.srtt
+    );
     Ok(())
 }
