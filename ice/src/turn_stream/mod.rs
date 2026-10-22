@@ -27,6 +27,29 @@
 //!
 //! [`dial`] opens the stream for a TURN URL (TCP, or TLS with the webpki
 //! roots), bounded by one deadline for connect and handshake.
+//!
+//! # Pinned server certificates
+//!
+//! A `turns:` server is verified against the webpki roots (the Mozilla root
+//! store), and its certificate must name the URL's host in a subjectAltName.
+//! A private deployment whose TURN server carries a self-signed certificate,
+//! or one issued by the deployment's own CA, is refused by that — correctly.
+//! For such a server the caller pins the server's certificate: a pinned
+//! certificate is the server's identity, so a server presenting exactly that
+//! certificate (DER, byte for byte) is accepted without a name, chain or
+//! validity check, and any other certificate is verified against the webpki
+//! roots as without pins. The handshake signature is verified in either case,
+//! so the server must hold the pinned certificate's private key.
+//!
+//! Pins reach a dial two ways, and both apply:
+//!
+//! - per agent, [`AgentConfig::turn_pinned_server_certs`](crate::agent::agent_config::AgentConfig::turn_pinned_server_certs);
+//! - process-wide, [`pin_server_certs`], for callers that do not build the
+//!   `AgentConfig` themselves (webrtc's `RTCPeerConnection` builds it from its
+//!   `SettingEngine`, which has no field for this).
+//!
+//! No pins (the default) means the webpki roots alone: the verification of
+//! stock rustls.
 
 #[cfg(test)]
 mod turn_stream_test;
@@ -42,7 +65,17 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::client::WebPkiServerVerifier;
+use tokio_rustls::rustls::pki_types::{ServerName, UnixTime};
+use tokio_rustls::rustls::{DigitallySignedStruct, SignatureScheme};
 use util::Conn;
+
+/// A certificate in DER, as [`pin_server_certs`] and
+/// `AgentConfig::turn_pinned_server_certs` take it (rustls' type).
+pub use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use crate::url::{ProtoType, SchemeType, Url};
 
@@ -351,14 +384,23 @@ pub fn is_stream_url(url: &Url) -> bool {
 /// TCP for `turns:` — within `deadline` for name resolution, connect and the
 /// TLS handshake together. The server's addresses are tried IPv4 first, as
 /// the UDP path binds IPv4.
-pub async fn dial(url: &Url, deadline: Duration) -> io::Result<TurnStreamConn> {
+///
+/// A `turns:` server is accepted when it presents one of `pinned` or one of
+/// the process-wide pins ([`pin_server_certs`]) byte for byte, or else a
+/// certificate the webpki roots validate for the URL's host (see the module
+/// documentation). `pinned` is not used for `turn:`.
+pub async fn dial(
+    url: &Url,
+    deadline: Duration,
+    pinned: &[CertificateDer<'static>],
+) -> io::Result<TurnStreamConn> {
     if !is_stream_url(url) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("not a TURN-over-TCP/TLS URL: {url}"),
         ));
     }
-    match tokio::time::timeout(deadline, dial_inner(url)).await {
+    match tokio::time::timeout(deadline, dial_inner(url, pinned)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -367,7 +409,7 @@ pub async fn dial(url: &Url, deadline: Duration) -> io::Result<TurnStreamConn> {
     }
 }
 
-async fn dial_inner(url: &Url) -> io::Result<TurnStreamConn> {
+async fn dial_inner(url: &Url, pinned: &[CertificateDer<'static>]) -> io::Result<TurnStreamConn> {
     let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
         .await?
         .collect();
@@ -392,32 +434,134 @@ async fn dial_inner(url: &Url) -> io::Result<TurnStreamConn> {
 
     tcp.set_nodelay(true)?;
     let (local_addr, remote_addr) = (tcp.local_addr()?, tcp.peer_addr()?);
-    let server_name = rustls::pki_types::ServerName::try_from(url.host.clone())
+    let server_name = ServerName::try_from(url.host.clone())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let tls = tokio_rustls::TlsConnector::from(tls_client_config()?)
+    let mut pins = pinned.to_vec();
+    for cert in process_pins() {
+        if !pins.contains(&cert) {
+            pins.push(cert);
+        }
+    }
+    let tls = tokio_rustls::TlsConnector::from(tls_client_config(pins)?)
         .connect(server_name, tcp)
         .await?;
     Ok(TurnStreamConn::new(tls, local_addr, remote_addr))
 }
 
+/// The certificates pinned process-wide (see [`pin_server_certs`]).
+static PROCESS_PINS: std::sync::Mutex<Vec<CertificateDer<'static>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Pins `certs` (DER) for every `turns:` dial in this process, in addition
+/// to each agent's `AgentConfig::turn_pinned_server_certs`: a TURN server
+/// presenting one of them byte for byte is accepted without a name, chain or
+/// validity check (see the module documentation).
+///
+/// For private deployments whose TURN server has a self-signed certificate,
+/// or one from the deployment's own CA, when the `AgentConfig` is built by
+/// someone else (webrtc's `SettingEngine` has no field for it). Pins are only
+/// ever added, never removed: a pin admits nothing but its own certificate,
+/// and two configurations in one process cannot take each other's pins away.
+/// Pinning nothing leaves the webpki roots alone in force.
+pub fn pin_server_certs<I>(certs: I)
+where
+    I: IntoIterator<Item = CertificateDer<'static>>,
+{
+    let mut pins = PROCESS_PINS.lock().unwrap_or_else(|e| e.into_inner());
+    for cert in certs {
+        if !pins.contains(&cert) {
+            pins.push(cert);
+        }
+    }
+}
+
+/// The certificates pinned process-wide so far.
+pub fn process_pins() -> Vec<CertificateDer<'static>> {
+    PROCESS_PINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The TLS client configuration for `turns:`: rustls with the ring provider
 /// (the one webrtc-dtls uses) and the Mozilla root store of webpki-roots;
-/// no client certificate.
-fn tls_client_config() -> io::Result<Arc<rustls::ClientConfig>> {
+/// with `pinned` certificates, a verifier that also accepts any of them
+/// byte for byte ([`PinnedOrWebpki`]); no client certificate.
+fn tls_client_config(
+    pinned: Vec<CertificateDer<'static>>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    #[cfg(test)]
-    for cert in turn_stream_test::extra_roots() {
-        roots.add(cert).map_err(io::Error::other)?;
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?;
+    let config = if pinned.is_empty() {
+        builder.with_root_certificates(roots)
+    } else {
+        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .map_err(io::Error::other)?;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedOrWebpki { pinned, webpki }))
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(io::Error::other)?
-    .with_root_certificates(roots)
     .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+/// A server certificate verifier that accepts an end-entity certificate
+/// equal to one of `pinned` and verifies any other with `webpki` (the
+/// webpki roots, the server name, validity). The handshake signatures are
+/// `webpki`'s checks in both cases: the server proves it holds the key of
+/// the certificate it presented.
+#[derive(Debug)]
+struct PinnedOrWebpki {
+    pinned: Vec<CertificateDer<'static>>,
+    webpki: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for PinnedOrWebpki {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        if self
+            .pinned
+            .iter()
+            .any(|pin| pin.as_ref() == end_entity.as_ref())
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.webpki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.webpki.supported_verify_schemes()
+    }
 }
 
 /// A relay candidate's conn (the `turn` client's relay conn) together with

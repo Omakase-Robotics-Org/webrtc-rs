@@ -65,6 +65,8 @@ pub struct AgentInternal {
 
     // the following variables won't be changed after init_with_defaults()
     pub(crate) insecure_skip_verify: bool,
+    /// AgentConfig::turn_pinned_server_certs.
+    pub(crate) turn_pinned_server_certs: Vec<crate::turn_stream::CertificateDer<'static>>,
     pub(crate) max_binding_requests: u16,
     pub(crate) host_acceptance_min_wait: Duration,
     pub(crate) srflx_acceptance_min_wait: Duration,
@@ -129,6 +131,7 @@ impl AgentInternal {
             connection_state: AtomicU8::new(ConnectionState::New as u8),
 
             insecure_skip_verify: config.insecure_skip_verify,
+            turn_pinned_server_certs: config.turn_pinned_server_certs.clone(),
 
             started_ch_tx: Mutex::new(Some(started_ch_tx)),
 

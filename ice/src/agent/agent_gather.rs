@@ -759,8 +759,10 @@ impl Agent {
     /// second name resolution). The dial deadline bounds a server that does
     /// not answer; the turn client's own transaction retransmissions are
     /// left as they are (a duplicate on a stream is answered or ignored by
-    /// the server and discarded by the client). `None` (logged) when the
-    /// network is virtual (vnet has no TCP) or the dial fails.
+    /// the server and discarded by the client). A `turns:` server is
+    /// verified against the webpki roots, or accepted by a pinned certificate
+    /// (the agent's `turn_pinned_server_certs` and the process-wide pins).
+    /// `None` (logged) when the network is virtual (vnet has no TCP) or the dial fails.
     async fn dial_turn_stream(
         url: &Url,
         net: &Arc<Net>,
@@ -774,7 +776,13 @@ impl Agent {
             );
             return None;
         }
-        match turn_stream::dial(url, TURN_STREAM_DIAL_TIMEOUT).await {
+        match turn_stream::dial(
+            url,
+            TURN_STREAM_DIAL_TIMEOUT,
+            &agent_internal.turn_pinned_server_certs,
+        )
+        .await
+        {
             Ok(conn) => Some(Arc::new(conn)),
             Err(err) => {
                 log::warn!(

@@ -170,6 +170,19 @@ pub struct AgentConfig {
 
     /// Include loopback addresses in the candidate list.
     pub include_loopback: bool,
+
+    /// Server certificates (DER) pinned for TURN over TLS (`turns:` URLs with
+    /// `transport=tcp`): a TURN server presenting one of them byte for byte
+    /// is accepted without a name, chain or validity check; any other
+    /// certificate is verified against the webpki roots as without pins
+    /// (see [`crate::turn_stream`]).
+    ///
+    /// For private deployments whose TURN server has a self-signed
+    /// certificate, or one from the deployment's own CA, that the public
+    /// roots do not cover. Empty (the default) means the webpki roots alone.
+    /// The process-wide pins of [`crate::turn_stream::pin_server_certs`]
+    /// apply as well.
+    pub turn_pinned_server_certs: Vec<crate::turn_stream::CertificateDer<'static>>,
 }
 
 impl AgentConfig {

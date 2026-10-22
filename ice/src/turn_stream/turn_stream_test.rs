@@ -18,15 +18,6 @@ use crate::candidate::CandidateType;
 use crate::error::Error;
 use crate::network_type::supported_network_types;
 
-/// Roots the TLS client trusts in tests besides webpki's (the self-signed
-/// certificate of the localhost TURN/TLS server).
-static EXTRA_ROOTS: std::sync::Mutex<Vec<CertificateDer<'static>>> =
-    std::sync::Mutex::new(Vec::new());
-
-pub(super) fn extra_roots() -> Vec<CertificateDer<'static>> {
-    EXTRA_ROOTS.lock().map(|r| r.clone()).unwrap_or_default()
-}
-
 /// A STUN binding request with a body of `body` bytes (a multiple of 4).
 fn stun(body: usize, tag: u8) -> Vec<u8> {
     let mut m = vec![0x00, 0x01];
@@ -277,6 +268,7 @@ async fn relay_only_over_stream(
     scheme: SchemeType,
     host: &str,
     server: &TestServer,
+    pinned: Vec<CertificateDer<'static>>,
 ) -> Result<(), Error> {
     let port = server.port;
     let url = Url {
@@ -291,6 +283,7 @@ async fn relay_only_over_stream(
         network_types: supported_network_types(),
         urls: vec![url.clone()],
         candidate_types: vec![CandidateType::Relay],
+        turn_pinned_server_certs: pinned.clone(),
         ..Default::default()
     };
 
@@ -369,68 +362,180 @@ async fn relay_only_over_stream(
 #[tokio::test]
 async fn test_relay_only_connection_over_turn_tcp() -> Result<(), Error> {
     let server = spawn_turn_stream_server(None).await?;
-    relay_only_over_stream(SchemeType::Turn, "127.0.0.1", &server).await?;
+    relay_only_over_stream(SchemeType::Turn, "127.0.0.1", &server, Vec::new()).await?;
     server.task.abort();
     Ok(())
 }
 
-#[tokio::test]
-async fn test_relay_only_connection_over_turn_tls() -> Result<(), Error> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
-    EXTRA_ROOTS.lock().unwrap().push(cert_der.clone());
+/// A self-signed certificate and its key: with `names` as its
+/// subjectAltNames, or, with none, no subjectAltName at all and `CN =
+/// 127.0.0.1` — the shape of a TURN server's certificate made with
+/// `openssl req -x509 -subj /CN=<its IP>`, which the webpki roots refuse for
+/// every server name.
+fn self_signed(names: &[&str]) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params =
+        rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+            .unwrap();
+    if names.is_empty() {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+    }
+    let cert = params.self_signed(&key).unwrap();
+    (
+        CertificateDer::from(cert.der().to_vec()),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    )
+}
+
+/// A TURN/TLS test server presenting `cert`.
+async fn spawn_turn_tls_server(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<TestServer, Error> {
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|e| Error::Other(e.to_string()))?
     .with_no_client_auth()
-    .with_single_cert(vec![cert_der], key_der)
+    .with_single_cert(vec![cert], key)
     .map_err(|e| Error::Other(e.to_string()))?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    Ok(spawn_turn_stream_server(Some(acceptor)).await?)
+}
 
-    let server = spawn_turn_stream_server(Some(acceptor)).await?;
-    // The certificate names `localhost`: the client checks it against the
-    // URL's host. `localhost` resolves IPv4 first (dial's order), where the
-    // server listens.
-    relay_only_over_stream(SchemeType::Turns, "localhost", &server).await?;
+fn turns_url(host: &str, port: u16) -> Url {
+    Url {
+        scheme: SchemeType::Turns,
+        host: host.to_owned(),
+        username: "username".to_owned(),
+        password: "password".to_owned(),
+        port,
+        proto: ProtoType::Tcp,
+    }
+}
+
+#[tokio::test]
+async fn test_relay_only_connection_over_turn_tls() -> Result<(), Error> {
+    // The dev TURN server's shape: self-signed, CN = its IP, no
+    // subjectAltName; trusted the way an operator does it, by pinning it in
+    // the agents' config.
+    let (cert, key) = self_signed(&[]);
+    let server = spawn_turn_tls_server(cert.clone(), key).await?;
+    relay_only_over_stream(SchemeType::Turns, "127.0.0.1", &server, vec![cert]).await?;
+    server.task.abort();
+    Ok(())
+}
+
+/// The relay candidates a relay-only agent with `config`'s one TURN URL
+/// gathers.
+async fn gathered_relay_candidates(config: AgentConfig) -> Result<usize, Error> {
+    let agent = Agent::new(config).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_candidate(Box::new(move |c| {
+        let _ = tx.send(c.is_some());
+        Box::pin(async {})
+    }));
+    agent.gather_candidates()?;
+    let mut gathered = 0;
+    // `None` marks the end of gathering.
+    while tokio::time::timeout(Duration::from_secs(8), rx.recv())
+        .await
+        .map_err(|_| Error::Other("gathering did not complete".to_owned()))?
+        .unwrap_or(false)
+    {
+        gathered += 1;
+    }
+    agent.close().await?;
+    Ok(gathered)
+}
+
+#[tokio::test]
+async fn test_relay_candidate_over_turn_tls_needs_the_pin() -> Result<(), Error> {
+    // The server of test_relay_only_connection_over_turn_tls: unpinned, its
+    // certificate is refused and no relay candidate is gathered; pinned in
+    // the agent's config, one is.
+    let (cert, key) = self_signed(&[]);
+    let server = spawn_turn_tls_server(cert.clone(), key).await?;
+    let config = |pinned: Vec<CertificateDer<'static>>| AgentConfig {
+        network_types: supported_network_types(),
+        urls: vec![turns_url("127.0.0.1", server.port)],
+        candidate_types: vec![CandidateType::Relay],
+        turn_pinned_server_certs: pinned,
+        ..Default::default()
+    };
+    assert_eq!(gathered_relay_candidates(config(Vec::new())).await?, 0);
+    assert_eq!(gathered_relay_candidates(config(vec![cert])).await?, 1);
     server.task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn test_tls_rejects_an_untrusted_certificate() -> Result<(), Error> {
-    let cert = rcgen::generate_simple_self_signed(vec!["untrusted.invalid".to_owned()])
-        .map_err(|e| Error::Other(e.to_string()))?;
-    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
-    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| Error::Other(e.to_string()))?
-    .with_no_client_auth()
-    .with_single_cert(vec![cert_der], key_der)
-    .map_err(|e| Error::Other(e.to_string()))?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-    let server = spawn_turn_stream_server(Some(acceptor)).await?;
-    let port = server.port;
+    let (cert, key) = self_signed(&["untrusted.invalid"]);
+    let server = spawn_turn_tls_server(cert, key).await?;
+    let url = turns_url("localhost", server.port);
 
-    let url = Url {
-        scheme: SchemeType::Turns,
-        host: "localhost".to_owned(),
-        username: "username".to_owned(),
-        password: "password".to_owned(),
-        port,
-        proto: ProtoType::Tcp,
-    };
-    let err = dial(&url, Duration::from_secs(2))
+    // No pin: the webpki roots alone, which do not cover it.
+    let err = dial(&url, Duration::from_secs(2), &[])
         .await
         .err()
         .expect("an untrusted certificate is refused");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+
+    // A pin admits its own certificate only, not another one.
+    let (other, _) = self_signed(&["untrusted.invalid"]);
+    let err = dial(&url, Duration::from_secs(2), &[other])
+        .await
+        .err()
+        .expect("a certificate that is not pinned is refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    server.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tls_accepts_a_pinned_certificate() -> Result<(), Error> {
+    // Without a subjectAltName (dialled by IP) and with one naming another
+    // host (dialled as localhost): a pinned match skips the name check.
+    for (names, host) in [
+        (&[][..], "127.0.0.1"),
+        (&["elsewhere.invalid"][..], "localhost"),
+    ] {
+        let (cert, key) = self_signed(names);
+        let server = spawn_turn_tls_server(cert.clone(), key).await?;
+        let url = turns_url(host, server.port);
+        let err = dial(&url, Duration::from_secs(2), &[])
+            .await
+            .err()
+            .expect("refused before the pin");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        let (unrelated, _) = self_signed(&[]);
+        let conn = dial(&url, Duration::from_secs(2), &[unrelated, cert]).await?;
+        conn.close().await?;
+        server.task.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tls_accepts_a_process_wide_pin() -> Result<(), Error> {
+    // A certificate of this test's own, so the process-wide pin admits
+    // nothing another test serves.
+    let (cert, key) = self_signed(&[]);
+    let server = spawn_turn_tls_server(cert.clone(), key).await?;
+    let url = turns_url("127.0.0.1", server.port);
+    assert!(dial(&url, Duration::from_secs(2), &[]).await.is_err());
+    pin_server_certs([cert.clone(), cert.clone()]);
+    assert_eq!(
+        process_pins().iter().filter(|p| **p == cert).count(),
+        1,
+        "pinned once"
+    );
+    let conn = dial(&url, Duration::from_secs(2), &[]).await?;
+    conn.close().await?;
     server.task.abort();
     Ok(())
 }
@@ -450,7 +555,7 @@ async fn test_dial_deadline() -> Result<(), Error> {
         proto: ProtoType::Tcp,
     };
     let started = Instant::now();
-    let err = dial(&url, Duration::from_millis(300))
+    let err = dial(&url, Duration::from_millis(300), &[])
         .await
         .err()
         .expect("no handshake, no conn");
