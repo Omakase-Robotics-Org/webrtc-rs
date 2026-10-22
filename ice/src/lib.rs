@@ -13,6 +13,7 @@ pub mod rand;
 pub mod state;
 pub mod stats;
 pub mod tcp_type;
+pub mod turn_stream;
 pub mod udp_mux;
 pub mod udp_network;
 pub mod url;

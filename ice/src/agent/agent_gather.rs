@@ -14,6 +14,7 @@ use crate::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig
 use crate::candidate::*;
 use crate::error::*;
 use crate::network_type::*;
+use crate::turn_stream;
 use crate::udp_network::UDPNetwork;
 use crate::url::{ProtoType, SchemeType, Url};
 use crate::util::*;
@@ -25,6 +26,12 @@ use crate::util::*;
 /// only a server that answers none of the requests holds gathering, and
 /// with it any ICE restart, for the full 5 s.
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a relay candidate over TURN/TCP or TURN/TLS may take to resolve
+/// the server's name, connect and finish the TLS handshake. A server that
+/// does not answer would otherwise hold gathering for the OS's connect
+/// timeout (over a minute); the same 5 s as a server-reflexive transaction.
+const TURN_STREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) udp_network: UDPNetwork,
@@ -741,6 +748,46 @@ impl Agent {
         wg.wait().await;
     }
 
+    /// Opens the stream for a relay candidate over TURN/TCP
+    /// (`turn:…?transport=tcp`) or TURN/TLS (`turns:…?transport=tcp`): the
+    /// `turn` client then runs unchanged on a conn that frames its datagrams
+    /// on the stream (crate::turn_stream), so allocation, permissions,
+    /// channel bindings and the data path (ChannelData, Send indications)
+    /// are the UDP path's. The relayed address is still UDP, so the
+    /// candidate's network stays udp; its related address is the stream's
+    /// local end, and the turn client is pointed at the address dialled (no
+    /// second name resolution). The dial deadline bounds a server that does
+    /// not answer; the turn client's own transaction retransmissions are
+    /// left as they are (a duplicate on a stream is answered or ignored by
+    /// the server and discarded by the client). `None` (logged) when the
+    /// network is virtual (vnet has no TCP) or the dial fails.
+    async fn dial_turn_stream(
+        url: &Url,
+        net: &Arc<Net>,
+        agent_internal: &Arc<AgentInternal>,
+    ) -> Option<Arc<dyn Conn + Send + Sync>> {
+        if net.is_virtual() {
+            log::warn!(
+                "[{}]: TURN over TCP/TLS is not available on a virtual network: {}",
+                agent_internal.get_name(),
+                url
+            );
+            return None;
+        }
+        match turn_stream::dial(url, TURN_STREAM_DIAL_TIMEOUT).await {
+            Ok(conn) => Some(Arc::new(conn)),
+            Err(err) => {
+                log::warn!(
+                    "[{}]: Failed to connect to the TURN server {}: {}",
+                    agent_internal.get_name(),
+                    url,
+                    err
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) async fn gather_candidates_relay(
         urls: Vec<Url>,
         net: Arc<Net>,
@@ -777,7 +824,23 @@ impl Agent {
             tokio::spawn(async move {
                 let _d = w;
 
-                let turn_server_addr = format!("{}:{}", url.host, url.port);
+                let mut turn_server_addr = format!("{}:{}", url.host, url.port);
+                // The stream a TURN/TCP or TURN/TLS client runs on, closed
+                // with the relay candidate (turn_stream::RelayConnOverStream).
+                let mut stream_conn: Option<Arc<dyn Conn + Send + Sync>> = None;
+
+                // TURN over TCP or TLS: the stream, dialled first (see
+                // dial_turn_stream).
+                if turn_stream::is_stream_url(&url) {
+                    let Some(conn) = Self::dial_turn_stream(&url, &net2, &agent_internal2).await
+                    else {
+                        return Ok(());
+                    };
+                    if let Some(remote) = conn.remote_addr() {
+                        turn_server_addr = remote.to_string();
+                    }
+                    stream_conn = Some(conn);
+                }
 
                 let (loc_conn, rel_addr, rel_port) =
                     if url.proto == ProtoType::Udp && url.scheme == SchemeType::Turn {
@@ -801,6 +864,13 @@ impl Agent {
                     case a.proxyDialer != nil && url.Proto == ProtoTypeTCP && (url.Scheme == SchemeTypeTURN || url.Scheme == SchemeTypeTURNS):
                     case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURN:
                     case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURNS:*/
+                    } else if let Some(conn) = &stream_conn {
+                        // pion's last two cases above, TURN over TCP and TLS:
+                        // the stream dialled before this (dial_turn_stream).
+                        // TURNS over UDP (DTLS) and a proxy dialer remain TODO.
+                        let local_addr = conn.local_addr()?;
+                        let rel_addr = local_addr.ip().to_string();
+                        (Arc::clone(conn), rel_addr, local_addr.port())
                     } else {
                         log::warn!(
                             "[{}]: Unable to handle URL in gather_candidates_relay {}",
@@ -845,7 +915,13 @@ impl Agent {
                 }
 
                 let relay_conn: Arc<dyn Conn + Send + Sync> = match client.allocate().await {
-                    Ok(conn) => Arc::new(conn),
+                    Ok(conn) => match &stream_conn {
+                        Some(stream) => Arc::new(turn_stream::RelayConnOverStream {
+                            relay: Arc::new(conn),
+                            stream: Arc::clone(stream),
+                        }),
+                        None => Arc::new(conn),
+                    },
                     Err(err) => {
                         let _ = client.close().await;
                         log::warn!(

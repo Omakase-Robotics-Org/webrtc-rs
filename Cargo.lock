@@ -2209,6 +2209,7 @@ version = "0.23.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd3c25631629d034ce7cd9940adc9d45762d46de2b0f57193c4443b92c6d4d40"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2643,6 +2644,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2936,6 +2947,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "1.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "webrtc"
 version = "0.17.2"
 dependencies = [
@@ -3008,6 +3028,7 @@ dependencies = [
  "log",
  "portable-atomic",
  "rand",
+ "rcgen",
  "regex",
  "serde",
  "serde_json",
@@ -3015,10 +3036,12 @@ dependencies = [
  "stun",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "turn",
  "url",
  "uuid",
  "waitgroup",
+ "webpki-roots",
  "webrtc-mdns",
  "webrtc-util",
 ]
