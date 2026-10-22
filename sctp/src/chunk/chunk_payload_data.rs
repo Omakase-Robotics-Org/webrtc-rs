@@ -122,6 +122,11 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+
+    /// This chunk has been fast-retransmitted once and is ineligible for a
+    /// subsequent fast retransmit (RFC 4960 sec 7.2.4, step 5). A T3-rtx
+    /// retransmission does not set it.
+    pub(crate) fast_retransmitted: bool,
 }
 
 impl Default for ChunkPayloadData {
@@ -143,6 +148,7 @@ impl Default for ChunkPayloadData {
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            fast_retransmitted: false,
         }
     }
 }
@@ -222,6 +228,7 @@ impl Chunk for ChunkPayloadData {
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            fast_retransmitted: false,
         })
     }
 

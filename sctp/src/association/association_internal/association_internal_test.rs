@@ -719,3 +719,138 @@ async fn test_no_rtt_sample_from_chunks_outstanding_across_t3_expiry() -> Result
     );
     Ok(())
 }
+
+/// Five chunks (TSN 10..=14) sent once, outstanding, on an established
+/// association, then a T3-rtx expiry and its retransmission of all five:
+/// the state when a path outage has swallowed both the first transmission
+/// and the T3-rtx retransmission.
+async fn outage_test_association() -> AssociationInternal {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    a.cumulative_tsn_ack_point = 9;
+    a.min_tsn2measure_rtt = 10;
+    a.rtt_exclude_below = 10;
+    a.my_next_tsn = 15;
+    a.rwnd = 1 << 20;
+    for tsn in 10..15 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        });
+    }
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    let resent = a.get_data_packets_to_retransmit();
+    assert_eq!(
+        resent.len(),
+        1,
+        "one packet carries the T3-rtx retransmission"
+    );
+    for tsn in 10..15 {
+        assert_eq!(a.inflight_queue.get(tsn).unwrap().nsent, 2, "tsn {tsn}");
+    }
+    a
+}
+
+/// A SACK with cumulative TSN 9 and one gap block acknowledging
+/// 11..=(10 + `end`) relative to it.
+fn sack_gap_from_11(end: u16) -> ChunkSelectiveAck {
+    ChunkSelectiveAck {
+        cumulative_tsn_ack: 9,
+        advertised_receiver_window_credit: 1 << 20,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end }],
+        duplicate_tsn: vec![],
+    }
+}
+
+/// The TSNs a fast-retransmission gather sends.
+fn fast_retransmitted_tsns(a: &mut AssociationInternal) -> Vec<u32> {
+    a.gather_outbound_fast_retransmission_packets(vec![])
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .filter_map(|c| c.as_any().downcast_ref::<ChunkPayloadData>())
+        .map(|c| c.tsn)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_fast_retransmit_of_a_chunk_lost_after_its_t3_retransmission() -> Result<()> {
+    let mut a = outage_test_association().await;
+
+    // The path is back: 11, 12 and 13 arrive, 10 (sent twice) does not.
+    // Three miss indications (HTNA 11, 12, 13) make it eligible for a fast
+    // retransmit (RFC 4960 sec 7.2.4) although it was sent more than once.
+    for end in 2..=4 {
+        a.handle_sack(&sack_gap_from_11(end)).await?;
+    }
+    assert_eq!(a.inflight_queue.get(10).unwrap().miss_indicator, 3);
+    assert!(a.in_fast_recovery);
+    assert_eq!(fast_retransmitted_tsns(&mut a), vec![10]);
+    let c = a.inflight_queue.get(10).unwrap();
+    assert_eq!(c.nsent, 3);
+    assert!(c.fast_retransmitted);
+    assert_eq!(a.stats.get_num_fast_retrans(), 1);
+
+    // Step 5: a chunk fast-retransmitted once is not fast-retransmitted
+    // again, whatever the next SACKs say; the T3-rtx timer resends it.
+    a.handle_sack(&sack_gap_from_11(5)).await?;
+    a.will_retransmit_fast = true;
+    assert!(fast_retransmitted_tsns(&mut a).is_empty());
+    assert_eq!(a.stats.get_num_fast_retrans(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_miss_indications_restart_at_a_t3_retransmission() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    a.cumulative_tsn_ack_point = 9;
+    a.my_next_tsn = 15;
+    for tsn in 10..15 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        });
+    }
+    // Two SACKs report 10 missing before the T3-rtx timer resends it.
+    for end in 2..=3 {
+        a.handle_sack(&sack_gap_from_11(end)).await?;
+    }
+    assert_eq!(a.inflight_queue.get(10).unwrap().miss_indicator, 2);
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    a.get_data_packets_to_retransmit();
+    let c = a.inflight_queue.get(10).unwrap();
+    assert_eq!((c.nsent, c.miss_indicator), (2, 0));
+
+    // One more report counts against the new copy only: no fast retransmit
+    // while that copy may still be in flight.
+    a.handle_sack(&sack_gap_from_11(4)).await?;
+    assert_eq!(a.inflight_queue.get(10).unwrap().miss_indicator, 1);
+    assert!(fast_retransmitted_tsns(&mut a).is_empty());
+    Ok(())
+}

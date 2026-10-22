@@ -467,7 +467,15 @@ impl AssociationInternal {
             loop {
                 let tsn = self.cumulative_tsn_ack_point + i + 1;
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
+                    // RFC 4960 Sec 7.2.4, step 5: a chunk that has been fast
+                    // retransmitted is ineligible for a subsequent fast
+                    // retransmit. A chunk retransmitted by the T3-rtx timer
+                    // stays eligible: excluding every chunk sent more than
+                    // once (`nsent > 1`, as before) left a chunk whose T3
+                    // retransmission was lost (a path outage) waiting for
+                    // the next T3 expiry, up to an RTO after the path was
+                    // back, while every SACK reported it missing.
+                    if c.acked || c.abandoned() || c.fast_retransmitted || c.miss_indicator < 3 {
                         i += 1;
                         continue;
                     }
@@ -490,6 +498,7 @@ impl AssociationInternal {
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
                     c.nsent += 1;
+                    c.fast_retransmitted = true;
                 } else {
                     break; // end of pending data
                 }
@@ -2101,6 +2110,11 @@ impl AssociationInternal {
                 // reset the retransmit flag not to retransmit again before the next
                 // t3-rtx timer fires
                 c.retransmit = false;
+                // Miss indications count against the latest transmission: a
+                // SACK that reported this TSN missing before it was resent
+                // says nothing about the copy now sent, so it must not count
+                // toward that copy's fast retransmit (RFC 4960 Sec 7.2.4).
+                c.miss_indicator = 0;
                 bytes_to_send += c.user_data.len();
 
                 c.nsent += 1;
