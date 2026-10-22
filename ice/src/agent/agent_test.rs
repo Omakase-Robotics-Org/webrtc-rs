@@ -2201,3 +2201,182 @@ async fn test_lite_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+/// A controlling agent with one host pair (192.168.0.2:777 -> 172.17.0.3:999)
+/// in `state`, the remote credentials set, and a Binding request from the
+/// controlled peer on that pair.
+async fn controlling_agent_with_pair(
+    state: CandidatePairState,
+) -> Result<(Agent, Arc<CandidatePair>, Message)> {
+    let a = Agent::new(AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    })
+    .await?;
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let remote: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "172.17.0.3".to_owned(),
+                port: 999,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    {
+        let mut remote_candidates = a.internal.remote_candidates.lock().await;
+        remote_candidates
+            .entry(remote.network_type())
+            .or_default()
+            .push(Arc::clone(&remote));
+    }
+    a.internal
+        .set_remote_credentials(
+            "remoteufrag".to_owned(),
+            "remotepasswordremotepwd".to_owned(),
+        )
+        .await?;
+    a.internal
+        .add_pair(Arc::clone(&local), Arc::clone(&remote))
+        .await;
+    let p = a
+        .internal
+        .find_pair(&local, &remote)
+        .await
+        .expect("the pair");
+    p.state.store(state as u8, Ordering::SeqCst);
+    if state == CandidatePairState::Failed {
+        p.binding_request_count
+            .store(a.internal.max_binding_requests + 1, Ordering::SeqCst);
+    }
+    let (username, local_pwd) = {
+        let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+            ufrag_pwd.local_pwd.clone(),
+        )
+    };
+    let msg = build_msg(CLASS_REQUEST, username, local_pwd)?;
+    Ok((a, p, msg))
+}
+
+/// The outbound requests the agent has sent, by destination.
+async fn requests_sent(a: &Agent) -> Vec<(SocketAddr, bool)> {
+    let pending = a.internal.pending_binding_requests.lock().await;
+    pending
+        .iter()
+        .map(|r| (r.destination, r.is_use_candidate))
+        .collect()
+}
+
+/// Whether a forced run of the check loop is queued (and consume it).
+async fn forced_check_queued(a: &Agent) -> bool {
+    let mut rx = a.internal.done_and_force_candidate_contact_rx.lock().await;
+    let (_, force_rx) = rx.as_mut().expect("the check loop has not taken it");
+    force_rx.try_recv().is_ok()
+}
+
+// RFC 8445 §7.3.1.4: a Binding request on a Failed pair puts it back to
+// Waiting with a fresh request budget and runs the check loop at once,
+// whose tick sends the check.
+#[tokio::test]
+async fn test_controlling_triggered_check_on_failed_pair() -> Result<()> {
+    let (a, p, mut msg) = controlling_agent_with_pair(CandidatePairState::Failed).await?;
+    let local = Arc::clone(&p.local);
+    a.internal
+        .handle_inbound(&mut msg, &local, SocketAddr::from_str("172.17.0.3:999")?)
+        .await;
+
+    assert_eq!(
+        p.state.load(Ordering::SeqCst),
+        CandidatePairState::Waiting as u8,
+        "the failed pair is waiting again"
+    );
+    assert_eq!(
+        p.binding_request_count.load(Ordering::SeqCst),
+        0,
+        "a fresh request budget"
+    );
+    assert!(forced_check_queued(&a).await, "the check loop runs at once");
+    assert!(
+        requests_sent(&a).await.is_empty(),
+        "nothing sent from the request"
+    );
+
+    // The forced tick.
+    a.internal.ping_all_candidates().await;
+    assert_eq!(
+        requests_sent(&a).await,
+        vec![(SocketAddr::from_str("172.17.0.3:999")?, false)],
+        "the triggered check"
+    );
+    assert_eq!(
+        p.state.load(Ordering::SeqCst),
+        CandidatePairState::InProgress as u8
+    );
+    a.close().await?;
+    Ok(())
+}
+
+// A request on a pair that is being checked already queues nothing more:
+// one request per tick, whatever the peer sends.
+#[tokio::test]
+async fn test_controlling_request_on_pair_in_progress() -> Result<()> {
+    let (a, p, mut msg) = controlling_agent_with_pair(CandidatePairState::InProgress).await?;
+    p.binding_request_count.store(3, Ordering::SeqCst);
+    let local = Arc::clone(&p.local);
+    a.internal
+        .handle_inbound(&mut msg, &local, SocketAddr::from_str("172.17.0.3:999")?)
+        .await;
+
+    assert!(!forced_check_queued(&a).await, "no extra tick");
+    assert_eq!(p.binding_request_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        p.state.load(Ordering::SeqCst),
+        CandidatePairState::InProgress as u8
+    );
+    a.close().await?;
+    Ok(())
+}
+
+// With a selected pair the controlling agent only answers, as before.
+#[tokio::test]
+async fn test_controlling_no_triggered_check_with_selected_pair() -> Result<()> {
+    let (a, p, mut msg) = controlling_agent_with_pair(CandidatePairState::Failed).await?;
+    let local = Arc::clone(&p.local);
+    let selected = Arc::new(CandidatePair::new(
+        Arc::clone(&p.local),
+        Arc::clone(&p.remote),
+        true,
+    ));
+    a.internal.agent_conn.selected_pair.store(Some(selected));
+    a.internal
+        .handle_inbound(&mut msg, &local, SocketAddr::from_str("172.17.0.3:999")?)
+        .await;
+
+    assert!(requests_sent(&a).await.is_empty(), "no request sent");
+    assert!(!forced_check_queued(&a).await, "no extra tick");
+    assert_eq!(
+        p.state.load(Ordering::SeqCst),
+        CandidatePairState::Failed as u8
+    );
+    a.close().await?;
+    Ok(())
+}

@@ -515,7 +515,7 @@ impl AgentInternal {
         }
     }
 
-    fn request_connectivity_check(&self) {
+    pub(crate) fn request_connectivity_check(&self) {
         let _ = self.force_candidate_contact_tx.try_send(true);
     }
 

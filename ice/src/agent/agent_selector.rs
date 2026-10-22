@@ -159,6 +159,46 @@ impl AgentInternal {
         }
     }
 
+    /// A triggered check (RFC 8445 §7.3.1.4) on the `Failed` pair `p`,
+    /// which a Binding request from the peer has just arrived on.
+    ///
+    /// webrtc-ice 0.17.2's controlling agent only answered such a request:
+    /// a pair that had used up its `max_binding_requests` stayed `Failed`
+    /// for the rest of the ICE generation, so when a path came back after
+    /// both agents' checks had run out, the controlled agent's check was
+    /// answered and the controlling agent sent nothing until the
+    /// application restarted ICE (3.9 s after the path returned, on a
+    /// robot after an 8 s blackhole). RFC 8445 §7.3.1.4: a Failed pair
+    /// that receives a request goes back to Waiting and is enqueued in the
+    /// triggered-check queue. Here it goes back to `Waiting` with a fresh
+    /// request budget, and the check loop runs at once instead of at its
+    /// next tick, so the check goes out now and the pair gets its usual
+    /// `max_binding_requests` from here.
+    ///
+    /// A `Waiting` or `InProgress` pair is checked on every tick already,
+    /// so a request on it needs nothing more. The check is not sent from
+    /// here, once per request received: the controlled agent pings back on
+    /// every request, and the two would echo checks at the round-trip rate.
+    /// Going through the check loop keeps the RFC's pacing (§6.1.4.2): one
+    /// forced tick per Failed → Waiting transition.
+    ///
+    /// Only while no pair is selected: with a selected pair the steady
+    /// state (consent checks on that pair only) is unchanged.
+    fn trigger_check_on_failed_pair(&self, p: &Arc<CandidatePair>) {
+        if self.agent_conn.get_selected_pair().is_some() {
+            return;
+        }
+        log::trace!(
+            "[{}]: triggered check on failed pair {}",
+            self.get_name(),
+            p
+        );
+        p.binding_request_count.store(0, Ordering::SeqCst);
+        p.state
+            .store(CandidatePairState::Waiting as u8, Ordering::SeqCst);
+        self.request_connectivity_check();
+    }
+
     pub(crate) async fn start(&self) {
         if self.is_controlling.load(Ordering::SeqCst) {
             ControllingSelector::start(self).await;
@@ -359,6 +399,11 @@ impl ControllingSelector for AgentInternal {
         log::trace!("controllingSelector: sendBindingSuccess");
 
         if let Some(p) = self.find_pair(local, remote).await {
+            if p.state.load(Ordering::SeqCst) == CandidatePairState::Failed as u8 {
+                self.trigger_check_on_failed_pair(&p);
+                return;
+            }
+
             let nominated_pair_is_none = {
                 let nominated_pair = self.nominated_pair.lock().await;
                 nominated_pair.is_none()
