@@ -996,6 +996,94 @@ async fn test_failed_pairs_recover_without_restart() -> Result<(), Error> {
 //use std::io::Write;
 
 // Agent.Write should use the best valid pair if a selected pair is not yet available
+// Gathering starts on a dead path (an ICE restart made during an outage)
+// and the path returns 1 s in. The STUN binding request is retransmitted
+// (RFC 8489 sec 6.2.1: 0, 0.5, 1.5, 3.5 s within the 5 s deadline), so the
+// server-reflexive candidate is gathered at the first request after the
+// return and gathering completes then, not at the deadline without one.
+#[tokio::test]
+async fn test_gathering_completes_once_the_path_returns() -> Result<(), Error> {
+    let wan = router::Router::new(router::RouterConfig {
+        cidr: "0.0.0.0/0".to_owned(),
+        ..Default::default()
+    })?;
+    let blocked = Arc::new(AtomicU64::new(1));
+    let blocked2 = Arc::clone(&blocked);
+    wan.add_chunk_filter(Box::new(move |_c: &(dyn Chunk + Send + Sync)| -> bool {
+        blocked2.load(Ordering::SeqCst) != 1
+    }))
+    .await;
+    let wan = Arc::new(Mutex::new(wan));
+
+    let wnet = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ip: VNET_STUN_SERVER_IP.to_owned(),
+        ..Default::default()
+    })));
+    connect_net2router(&wnet, &wan).await?;
+    let net0 = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec![VNET_GLOBAL_IPA.to_owned()],
+        ..Default::default()
+    })));
+    connect_net2router(&net0, &wan).await?;
+    start_router(&wan).await?;
+    let server = add_vnet_stun(wnet).await?;
+
+    let agent = Agent::new(AgentConfig {
+        urls: vec![Url::parse_url(&format!(
+            "stun:{VNET_STUN_SERVER_IP}:{VNET_STUN_SERVER_PORT}"
+        ))?],
+        network_types: vec![NetworkType::Udp4],
+        candidate_types: vec![CandidateType::ServerReflexive],
+        multicast_dns_mode: MulticastDnsMode::Disabled,
+        net: Some(net0),
+        ..Default::default()
+    })
+    .await?;
+
+    let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+    let srflx = Arc::new(AtomicU64::new(0));
+    let srflx2 = Arc::clone(&srflx);
+    agent.on_candidate(Box::new(
+        move |c: Option<Arc<dyn Candidate + Send + Sync>>| {
+            let (done_tx, srflx) = (done_tx.clone(), Arc::clone(&srflx2));
+            Box::pin(async move {
+                match c {
+                    Some(c) if c.candidate_type() == CandidateType::ServerReflexive => {
+                        srflx.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some(_) => {}
+                    None => {
+                        let _ = done_tx.send(()).await;
+                    }
+                }
+            })
+        },
+    ));
+    let start = tokio::time::Instant::now();
+    agent.gather_candidates()?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    blocked.store(0, Ordering::SeqCst);
+
+    let complete = tokio::time::timeout(Duration::from_secs(6), done_rx.recv()).await;
+    let took = start.elapsed();
+    assert!(complete.is_ok(), "gathering never completed");
+    assert_eq!(
+        srflx.load(Ordering::SeqCst),
+        1,
+        "a srflx candidate gathered"
+    );
+    assert!(
+        took < Duration::from_millis(2000),
+        "gathering completed {took:?} after it began (the request after the return is due at 1.5 s)"
+    );
+
+    agent.close().await?;
+    server.close().await?;
+    wan.lock().await.stop().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_write_use_valid_pair() -> Result<(), Error> {
     /*env_logger::Builder::new()

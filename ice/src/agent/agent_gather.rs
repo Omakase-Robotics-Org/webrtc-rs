@@ -18,6 +18,12 @@ use crate::udp_network::UDPNetwork;
 use crate::url::{ProtoType, SchemeType, Url};
 use crate::util::*;
 
+/// How long a server-reflexive candidate's STUN transaction may take. Its
+/// binding request is retransmitted inside it (`stun_request_schedule`:
+/// 0, 0.5, 1.5 and 3.5 s), so a server that answers ends the gatherer task
+/// at once, and gathering is `Complete` as soon as every task has returned;
+/// only a server that answers none of the requests holds gathering, and
+/// with it any ICE restart, for the full 5 s.
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct GatherCandidatesInternalParams {

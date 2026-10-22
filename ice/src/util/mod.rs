@@ -65,6 +65,45 @@ pub async fn get_xormapped_addr(
 
 const MAX_MESSAGE_SIZE: usize = 1280;
 
+/// The first retransmission timeout of a STUN binding request sent while
+/// gathering: RFC 8489 sec 6.2.1 wants at least 500 ms, and RFC 8445 sec
+/// 14.3 gives MAX(500 ms, Ta * number of srflx and relay candidates) while
+/// gathering; each server-reflexive candidate here is gathered on its own
+/// socket and transaction, so 500 ms.
+pub(crate) const STUN_INITIAL_RTO: Duration = Duration::from_millis(500);
+
+/// The most requests one STUN transaction sends (RFC 8489 sec 6.2.1, `Rc`).
+pub(crate) const STUN_MAX_REQUESTS: usize = 7;
+
+/// When each request of a STUN transaction goes out, from the first:
+/// RFC 8489 sec 6.2.1's schedule, [`STUN_INITIAL_RTO`] doubled after each
+/// retransmission, at most [`STUN_MAX_REQUESTS`] requests, and none at or
+/// after `deadline` (zero: no deadline). With the 5 s gathering deadline:
+/// 0, 0.5, 1.5 and 3.5 s.
+pub(crate) fn stun_request_schedule(deadline: Duration) -> Vec<Duration> {
+    let mut schedule = Vec::with_capacity(STUN_MAX_REQUESTS);
+    let (mut at, mut rto) = (Duration::ZERO, STUN_INITIAL_RTO);
+    while schedule.len() < STUN_MAX_REQUESTS && (deadline.is_zero() || at < deadline) {
+        schedule.push(at);
+        at += rto;
+        rto *= 2;
+    }
+    schedule
+}
+
+/// Sends a STUN binding request to `server_addr` on `conn` and returns the
+/// first datagram that comes back, decoded, or an error once `deadline`
+/// (zero: none) has passed without one.
+///
+/// The request is retransmitted, with the same transaction ID, on
+/// [`stun_request_schedule`] until a response arrives. webrtc-ice 0.17.2
+/// sent it once: a request lost on a path that was dead when gathering
+/// began (an ICE restart made during an outage) was never sent again, so a
+/// path that returned a second later still gave no server-reflexive
+/// candidate, and gathering ran to its deadline (5 s) while the agent
+/// refused any newer restart. Now a returning path answers the next
+/// retransmission, at most one RTO after it is back. A send error ends the
+/// transaction as before (the `turn` client's transactions likewise).
 pub async fn stun_request(
     conn: &Arc<dyn Conn + Send + Sync>,
     server_addr: SocketAddr,
@@ -73,25 +112,44 @@ pub async fn stun_request(
     let mut request = Message::new();
     request.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
 
-    conn.send_to(&request.raw, server_addr).await?;
+    let start = tokio::time::Instant::now();
+    let schedule = stun_request_schedule(deadline);
     let mut bs = vec![0_u8; MAX_MESSAGE_SIZE];
-    let (n, _) = if deadline > Duration::from_secs(0) {
-        match tokio::time::timeout(deadline, conn.recv_from(&mut bs)).await {
-            Ok(result) => match result {
-                Ok((n, addr)) => (n, addr),
-                Err(err) => return Err(Error::Other(err.to_string())),
-            },
-            Err(err) => return Err(Error::Other(err.to_string())),
+    for (i, _) in schedule.iter().enumerate() {
+        if i > 0 {
+            log::trace!(
+                "retransmitting STUN binding request to {server_addr} ({})",
+                i + 1
+            );
         }
-    } else {
-        conn.recv_from(&mut bs).await?
-    };
+        conn.send_to(&request.raw, server_addr).await?;
 
-    let mut res = Message::new();
-    res.raw = bs[..n].to_vec();
-    res.decode()?;
+        // Wait for a response until the next request is due, or after the
+        // last one until the deadline (forever without one).
+        let until = match schedule.get(i + 1) {
+            Some(next) => Some(start + *next),
+            None if deadline > Duration::ZERO => Some(start + deadline),
+            None => None,
+        };
+        let received = match until {
+            Some(until) => tokio::time::timeout_at(until, conn.recv_from(&mut bs))
+                .await
+                .ok(),
+            None => Some(conn.recv_from(&mut bs).await),
+        };
+        if let Some(result) = received {
+            let (n, _) = result.map_err(|err| Error::Other(err.to_string()))?;
+            let mut res = Message::new();
+            res.raw = bs[..n].to_vec();
+            res.decode()?;
+            return Ok(res);
+        }
+    }
 
-    Ok(res)
+    Err(Error::Other(format!(
+        "no STUN response from {server_addr} within {deadline:?} ({} requests)",
+        schedule.len()
+    )))
 }
 
 pub async fn local_interfaces(
