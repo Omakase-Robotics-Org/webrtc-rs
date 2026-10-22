@@ -2380,3 +2380,64 @@ async fn test_controlling_no_triggered_check_with_selected_pair() -> Result<()> 
     a.close().await?;
     Ok(())
 }
+
+// A pair that used up its requests is checked again, one request per
+// FAILED_PAIR_RECHECK_INTERVAL, and stays Failed until it gets a response.
+#[tokio::test]
+async fn test_failed_pair_recheck_interval() -> Result<()> {
+    let (a, p, _) = controlling_agent_with_pair(CandidatePairState::Failed).await?;
+    let peer = SocketAddr::from_str("172.17.0.3:999")?;
+
+    a.internal.ping_all_candidates().await;
+    assert_eq!(
+        requests_sent(&a).await,
+        vec![(peer, false)],
+        "checked again"
+    );
+
+    // The check loop's next ticks, within the interval: nothing more.
+    for _ in 0..5 {
+        a.internal.ping_all_candidates().await;
+    }
+    assert_eq!(requests_sent(&a).await.len(), 1, "one per interval");
+
+    // One interval later: the next request.
+    {
+        let mut last = a.internal.last_failed_pair_recheck.lock();
+        *last = last.map(|t| t - FAILED_PAIR_RECHECK_INTERVAL);
+    }
+    a.internal.ping_all_candidates().await;
+    assert_eq!(
+        requests_sent(&a).await,
+        vec![(peer, false), (peer, false)],
+        "checked again after the interval"
+    );
+    assert_eq!(
+        p.state.load(Ordering::SeqCst),
+        CandidatePairState::Failed as u8,
+        "still failed until a response"
+    );
+    a.close().await?;
+    Ok(())
+}
+
+// Once a pair has succeeded the agent nominates instead: failed pairs are
+// not checked again.
+#[tokio::test]
+async fn test_no_failed_pair_recheck_once_a_pair_succeeded() -> Result<()> {
+    let (a, p, _) = controlling_agent_with_pair(CandidatePairState::Failed).await?;
+    let succeeded = Arc::new(CandidatePair::new(
+        Arc::clone(&p.local),
+        Arc::clone(&p.remote),
+        true,
+    ));
+    succeeded
+        .state
+        .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
+    a.internal.agent_conn.checklist.lock().await.push(succeeded);
+
+    a.internal.ping_all_candidates().await;
+    assert!(requests_sent(&a).await.is_empty(), "no request sent");
+    a.close().await?;
+    Ok(())
+}

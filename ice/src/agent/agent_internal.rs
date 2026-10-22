@@ -85,6 +85,9 @@ pub struct AgentInternal {
     // Tracks the last time a STUN consent binding request was sent (nanos since UNIX_EPOCH).
     // Used to enforce RFC 7675 consent freshness independently of media traffic.
     pub(crate) last_consent_ping: AtomicU64,
+
+    // When failed pairs were last checked again (`FAILED_PAIR_RECHECK_INTERVAL`).
+    pub(crate) last_failed_pair_recheck: SyncMutex<Option<Instant>>,
 }
 
 impl AgentInternal {
@@ -163,6 +166,7 @@ impl AgentInternal {
             agent_conn: Arc::new(AgentConn::new()),
 
             last_consent_ping: AtomicU64::new(0),
+            last_failed_pair_recheck: SyncMutex::new(None),
         };
 
         let chan_receivers = ChanReceivers {
@@ -379,8 +383,48 @@ impl AgentInternal {
                     self.get_name(),
                 );
             }
+
+            // Failed pairs are checked again, one request each per
+            // FAILED_PAIR_RECHECK_INTERVAL, while no pair has succeeded: a
+            // path that returns after the checks ran out is otherwise never
+            // used in this ICE generation (see the constant). They stay
+            // Failed until a response arrives, which stores Succeeded as
+            // for any check. This runs only while no pair is selected (the
+            // selectors call ping_all_candidates only then) and never once
+            // the agent is Failed (contact returns early) or restarted (the
+            // checklist is cleared).
+            let recheck_failed = {
+                let now = Instant::now();
+                let mut last = self.last_failed_pair_recheck.lock();
+                let due = match *last {
+                    None => true,
+                    Some(t) => {
+                        now.checked_duration_since(t).unwrap_or_default()
+                            >= FAILED_PAIR_RECHECK_INTERVAL
+                    }
+                };
+                let any_succeeded = checklist
+                    .iter()
+                    .any(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8);
+                let any_failed = checklist
+                    .iter()
+                    .any(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Failed as u8);
+                let recheck = due && any_failed && !any_succeeded;
+                if recheck {
+                    *last = Some(now);
+                }
+                recheck
+            };
+
             for p in &mut *checklist {
                 let p_state = p.state.load(Ordering::SeqCst);
+                if p_state == CandidatePairState::Failed as u8 {
+                    if recheck_failed {
+                        log::trace!("[{}]: checking failed pair {} again", self.get_name(), p);
+                        pairs.push((p.local.clone(), p.remote.clone()));
+                    }
+                    continue;
+                }
                 if p_state == CandidatePairState::Waiting as u8 {
                     p.state
                         .store(CandidatePairState::InProgress as u8, Ordering::SeqCst);

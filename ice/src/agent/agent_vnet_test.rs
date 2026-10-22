@@ -884,6 +884,115 @@ async fn test_disconnected_to_connected() -> Result<(), Error> {
     Ok(())
 }
 
+// Both agents' checks run out while the path is blocked (no pair ever
+// succeeds), then the path returns. Without a restart, the agents connect
+// within one FAILED_PAIR_RECHECK_INTERVAL and a round trip: failed pairs
+// are checked again, and the request that reaches the other agent gets a
+// check back (RFC 8445 sec 7.3.1.4).
+#[tokio::test]
+async fn test_failed_pairs_recover_without_restart() -> Result<(), Error> {
+    let wan = router::Router::new(router::RouterConfig {
+        cidr: "0.0.0.0/0".to_owned(),
+        ..Default::default()
+    })?;
+
+    let blocked = Arc::new(AtomicU64::new(1));
+    let blocked2 = Arc::clone(&blocked);
+    wan.add_chunk_filter(Box::new(move |_c: &(dyn Chunk + Send + Sync)| -> bool {
+        blocked2.load(Ordering::SeqCst) != 1
+    }))
+    .await;
+    let wan = Arc::new(Mutex::new(wan));
+
+    let net0 = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec!["192.168.0.1".to_owned()],
+        ..Default::default()
+    })));
+    let net1 = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec!["192.168.0.2".to_owned()],
+        ..Default::default()
+    })));
+
+    connect_net2router(&net0, &wan).await?;
+    connect_net2router(&net1, &wan).await?;
+    start_router(&wan).await?;
+
+    // 8 checks per pair in 400 ms: they run out well inside the blackhole.
+    let check_interval = Duration::from_millis(50);
+    let new_agent = |net: Arc<net::Net>| {
+        Agent::new(AgentConfig {
+            network_types: supported_network_types(),
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            net: Some(net),
+            check_interval,
+            ..Default::default()
+        })
+    };
+    let controlling_agent = Arc::new(new_agent(Arc::clone(&net0)).await?);
+    let controlled_agent = Arc::new(new_agent(Arc::clone(&net1)).await?);
+
+    let mut states = Vec::new();
+    for agent in [&controlling_agent, &controlled_agent] {
+        let (tx, rx) = mpsc::channel::<ConnectionState>(100);
+        let tx = Arc::new(tx);
+        agent.on_connection_state_change(Box::new(move |c: ConnectionState| {
+            let tx = Arc::clone(&tx);
+            Box::pin(async move {
+                let _ = tx.try_send(c);
+            })
+        }));
+        states.push(rx);
+    }
+
+    {
+        let (a, b) = (
+            Arc::clone(&controlling_agent),
+            Arc::clone(&controlled_agent),
+        );
+        tokio::spawn(async move {
+            let _ = connect_with_vnet(&a, &b).await;
+        });
+    }
+
+    // Every pair fails on both sides.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    for (name, agent) in [
+        ("controlling", &controlling_agent),
+        ("controlled", &controlled_agent),
+    ] {
+        let checklist = agent.internal.agent_conn.checklist.lock().await;
+        assert!(!checklist.is_empty(), "{name}: no pairs");
+        assert!(
+            checklist
+                .iter()
+                .all(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Failed as u8),
+            "{name}: every pair failed"
+        );
+    }
+
+    blocked.store(0, Ordering::SeqCst);
+    let back = Instant::now();
+    let bound = FAILED_PAIR_RECHECK_INTERVAL + Duration::from_millis(500);
+    for rx in &mut states {
+        tokio::time::timeout(
+            bound,
+            block_until_state_seen(ConnectionState::Connected, rx),
+        )
+        .await
+        .map_err(|_| Error::Other(format!("not connected {bound:?} after the path returned")))?;
+    }
+    log::debug!("connected {:?} after the path returned", back.elapsed());
+
+    {
+        let mut w = wan.lock().await;
+        w.stop().await?;
+    }
+    controlling_agent.close().await?;
+    controlled_agent.close().await?;
+
+    Ok(())
+}
+
 //use std::io::Write;
 
 // Agent.Write should use the best valid pair if a selected pair is not yet available

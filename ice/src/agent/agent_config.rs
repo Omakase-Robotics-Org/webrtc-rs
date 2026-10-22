@@ -37,6 +37,21 @@ pub(crate) const DEFAULT_RELAY_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_mi
 /// Max binding request before considering a pair failed.
 pub(crate) const DEFAULT_MAX_BINDING_REQUESTS: u16 = 7;
 
+/// How often a pair that used up its `max_binding_requests` is checked
+/// again while the agent is still checking (no pair selected, none
+/// succeeded): one request per failed pair per interval.
+///
+/// webrtc-ice 0.17.2 gave such a pair up for the rest of the ICE
+/// generation, so a path that came back after the checks had run out (8
+/// checks, ~1.6 s at the default 200 ms interval) stayed unused until the
+/// application restarted ICE: 3.9 s after the path returned, on a robot
+/// after an 8 s blackhole with a restart inside it. Checking failed pairs
+/// again at a slow rate makes recovery independent of either side's check
+/// window: a path back at any time is used within one interval and a round
+/// trip. Browsers' agents keep checking failed pairs likewise. 1 s keeps a
+/// dead path's traffic to one small request per pair per second.
+pub(crate) const FAILED_PAIR_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The number of bytes that can be buffered before we start to error.
 pub(crate) const MAX_BUFFER_SIZE: usize = 1000 * 1000; // 1MB
 
